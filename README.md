@@ -6,6 +6,8 @@ DSH（DeepSeek Harness）Web GUI 的 MCP 管理插件：在 **设置 → MCP 管
 
 ![DSH 版本](https://img.shields.io/badge/DSH-0.1.0--rc.6-blue) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+![MCP 管理设置页截图](docs/mcp-manage.png)
+
 ## 功能
 
 - **查看所有已安装的 MCP 工具**：每个服务器以“N 个工具”可点击计数展示，点击展开/收起工具列表（`mcp__名称__*`），默认隐藏。
@@ -67,13 +69,15 @@ pnpm run build       # tsc 声明 + tsdown（lib/index.js + lib/client.js）
 
 MCP management plugin for the DSH (DeepSeek Harness) web GUI: a **Settings → MCP 管理** page that lists, adds, edits, deletes, and enables/disables MCP servers — effective immediately, no host restart, no dsh source changes.
 
+![Screenshot of the MCP management settings page](docs/mcp-manage.png)
+
 ## Features
 
-- **List every installed MCP tool**: managed servers show their discovered tools (`mcp__name__*`); servers provided by composition files (`cordis.yml` / `cordis.patch.yml`) appear in a separate read-only catalog.
+- **List every installed MCP tool**: each server shows a clickable "N 个工具" count that expands/collapses its tool list (`mcp__name__*`), hidden by default.
 - **Add**: `stdio` (command / args / env / cwd) and `streamable-http` (URL / headers) transports; saving loads a live instance immediately and its tools register right away.
 - **Edit**: restarting the instance under the new config is automatic.
-- **Delete / enable / disable**: dispose or reload the live instance in one gesture.
-- **Persistence**: records live in `$DSH_HOME/mcp-manage/servers.json` and every enabled server is restored on host start.
+- **Delete / enable / disable**: dispose or reload the live instance in one gesture. Works equally for **composition-provided MCP rows** (entries from `cordis.yml` / patches, e.g. cebridge): disable/remove takes effect at once, restore is always possible, overrides persist across host restarts, and the source composition files are never modified.
+- **Persistence**: records and overrides live in `$DSH_HOME/mcp-manage/servers.json`; enabled servers and composition overrides are restored on host start.
 - **Loud failures**: bad definitions surface as a failed row with the error text instead of silent background retries.
 
 ## Install
