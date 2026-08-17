@@ -1,11 +1,12 @@
 /**
  * The MCP management settings page body (JSX component).
  *
- * Sections: managed MCP server cards (state badge, discovered tool list,
- * enable switch, edit, delete), an add/edit form (stdio command/args/env/cwd
- * or Streamable HTTP url/headers), and a read-only catalog of every MCP tool
- * installed by the composition (`mcp__*` rows this plugin does not own).
- * Styled after the official settings pages (theme variables, card rows).
+ * Sections: managed MCP server cards (state badge, tool list behind the
+ * clickable tool count, enable switch, edit, delete), an add/edit form
+ * (stdio command/args/env/cwd or Streamable HTTP url/headers), and the
+ * composition-provided MCP catalog — equally manageable at runtime
+ * (enable/disable, delete with restore). Styled after the official settings
+ * pages (theme variables, card rows).
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -14,12 +15,15 @@ import {
   addServer,
   deleteServer,
   listServers,
+  removeExternal,
+  restoreExternal,
+  setExternalEnabled,
   setServerEnabled,
   updateServer,
   type MutationResult,
   type ServersSnapshot,
 } from './api.ts'
-import type { McpServerDef, McpServerView } from '../types.ts'
+import type { McpExternalServer, McpServerDef, McpServerView } from '../types.ts'
 
 /** Plugin CSS, scoped by a package-unique class prefix. */
 export const CSS = `
@@ -56,6 +60,9 @@ export const CSS = `
 .mcpm-switch:disabled { opacity: 0.5; cursor: default; }
 .mcpm-tools { display: flex; flex-wrap: wrap; gap: 4px; }
 .mcpm-tool { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; padding: 2px 6px; border-radius: 6px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); word-break: break-all; }
+.mcpm-count { margin-left: auto; font-size: 12px; color: var(--dsw-alias-label-secondary); background: none; border: none; padding: 2px 8px; border-radius: 8px; cursor: pointer; font-family: inherit; }
+.mcpm-count:hover { background: var(--dsw-alias-bg-layer-2); }
+.mcpm-count:disabled { cursor: default; opacity: 0.6; }
 .mcpm-form { display: flex; flex-direction: column; gap: 10px; }
 .mcpm-field { display: flex; flex-direction: column; gap: 4px; }
 .mcpm-label { font-size: 12px; color: var(--dsw-alias-label-secondary); }
@@ -80,6 +87,127 @@ function stateClass(state: McpServerView['state']): string {
   if (state === 'error') return 'mcpm-badge mcpm-badge-error'
   if (state === 'connecting') return 'mcpm-badge mcpm-badge-connecting'
   return 'mcpm-badge'
+}
+
+/** The clickable tool-count chip: expands the hidden tool list on click. */
+function ToolCount(props: { tools: readonly string[]; expanded: boolean; onToggle: () => void }): JSX.Element {
+  return (
+    <button type='button' className='mcpm-count'
+      disabled={props.tools.length === 0}
+      onClick={props.onToggle}
+      title={props.tools.length === 0 ? '未发现工具' : props.expanded ? '收起工具列表' : '展开工具列表'}>
+      {props.tools.length} 个工具 {props.tools.length > 0 ? (props.expanded ? '▲' : '▼') : ''}
+    </button>
+  )
+}
+
+/** The expandable tool list itself. */
+function ToolList(props: { tools: readonly string[]; expanded: boolean }): JSX.Element | null {
+  if (!props.expanded || props.tools.length === 0) return null
+  return (
+    <div className='mcpm-tools'>
+      {props.tools.map(tool => <span key={tool} className='mcpm-tool'>{tool}</span>)}
+    </div>
+  )
+}
+
+/** One managed server card. */
+function ServerCard(props: {
+  server: McpServerView
+  busy: boolean
+  onToggle: (server: McpServerView) => void
+  onEdit: (server: McpServerView) => void
+  onDelete: (server: McpServerView) => void
+}): JSX.Element {
+  const { server, busy, onToggle, onEdit, onDelete } = props
+  const [expanded, setExpanded] = useState(false)
+  const [confirming, setConfirming] = useState(false)
+  return (
+    <div className='mcpm-card'>
+      <div className='mcpm-card-top'>
+        <span className='mcpm-name'>{server.serverName}</span>
+        <span className='mcpm-badge'>{server.transport === 'stdio' ? 'stdio' : 'http'}</span>
+        <span className={stateClass(server.state)}>{stateLabel(server.state)}</span>
+        <ToolCount tools={server.tools} expanded={expanded} onToggle={() => setExpanded(!expanded)} />
+        <span className='mcpm-actions'>
+          <button type='button' className='mcpm-switch' data-on={server.enabled} disabled={busy}
+            title={server.enabled ? '停用' : '启用'}
+            onClick={() => onToggle(server)} aria-label={server.enabled ? '停用' : '启用'} />
+          <button type='button' className='mcpm-btn-ghost' disabled={busy} onClick={() => onEdit(server)}>编辑</button>
+          {confirming
+            ? (
+              <>
+                <button type='button' className='mcpm-btn-ghost mcpm-btn-danger' disabled={busy}
+                  onClick={() => onDelete(server)}>确认删除</button>
+                <button type='button' className='mcpm-btn-ghost' disabled={busy} onClick={() => setConfirming(false)}>取消</button>
+              </>
+            )
+            : (
+              <button type='button' className='mcpm-btn-ghost mcpm-btn-danger' disabled={busy}
+                onClick={() => setConfirming(true)}>删除</button>
+            )}
+        </span>
+      </div>
+      {server.error !== undefined && server.error !== '' ? <div className='mcpm-err'>{server.error}</div> : null}
+      <ToolList tools={server.tools} expanded={expanded} />
+      {server.transport === 'stdio'
+        ? <div className='mcpm-mono'>{[server.command, ...(server.args ?? [])].join(' ')}</div>
+        : <div className='mcpm-mono'>{server.url}</div>}
+    </div>
+  )
+}
+
+/** One composition-provided MCP card: enable switch, delete, restore. */
+function ExternalCard(props: {
+  row: McpExternalServer
+  busy: boolean
+  onToggle: (row: McpExternalServer) => void
+  onDelete: (row: McpExternalServer) => void
+  onRestore: (row: McpExternalServer) => void
+}): JSX.Element {
+  const { row, busy, onToggle, onDelete, onRestore } = props
+  const [expanded, setExpanded] = useState(false)
+  const [confirming, setConfirming] = useState(false)
+  const removed = row.override === 'removed'
+  const disabled = row.override === 'disabled'
+  return (
+    <div className='mcpm-card' style={removed ? { opacity: 0.65 } : undefined}>
+      <div className='mcpm-card-top'>
+        <span className='mcpm-name'>{row.serverName}</span>
+        <span className='mcpm-badge'>组合</span>
+        {removed
+          ? <span className='mcpm-badge'>已删除</span>
+          : <span className={disabled ? 'mcpm-badge' : 'mcpm-badge mcpm-badge-active'}>{disabled ? '已停用' : '运行中'}</span>}
+        {!removed
+          ? <ToolCount tools={row.tools} expanded={expanded} onToggle={() => setExpanded(!expanded)} />
+          : <span className='mcpm-meta'>已从运行组合中移除</span>}
+        <span className='mcpm-actions'>
+          {removed
+            ? <button type='button' className='mcpm-btn-ghost' disabled={busy} onClick={() => onRestore(row)}>恢复</button>
+            : (
+              <>
+                <button type='button' className='mcpm-switch' data-on={!disabled} disabled={busy}
+                  title={disabled ? '启用' : '停用'}
+                  onClick={() => onToggle(row)} aria-label={disabled ? '启用' : '停用'} />
+                {confirming
+                  ? (
+                    <>
+                      <button type='button' className='mcpm-btn-ghost mcpm-btn-danger' disabled={busy}
+                        onClick={() => onDelete(row)}>确认移除</button>
+                      <button type='button' className='mcpm-btn-ghost' disabled={busy} onClick={() => setConfirming(false)}>取消</button>
+                    </>
+                  )
+                  : (
+                    <button type='button' className='mcpm-btn-ghost mcpm-btn-danger' disabled={busy}
+                      onClick={() => setConfirming(true)}>移除</button>
+                  )}
+              </>
+            )}
+        </span>
+      </div>
+      <ToolList tools={row.tools} expanded={expanded} />
+    </div>
+  )
 }
 
 /** Draft form state derived from a definition (or blank for add). */
@@ -171,62 +299,6 @@ function draftToServer(draft: Draft): McpServerDef {
     }
   }
   return { ...base, url: draft.url.trim(), headers: parseHeaderLines(draft.headersText) }
-}
-
-/** One managed server card. */
-function ServerCard(props: {
-  server: McpServerView
-  busy: boolean
-  onToggle: (server: McpServerView) => void
-  onEdit: (server: McpServerView) => void
-  onDelete: (server: McpServerView) => void
-}): JSX.Element {
-  const { server, busy, onToggle, onEdit, onDelete } = props
-  const [expanded, setExpanded] = useState(false)
-  const [confirming, setConfirming] = useState(false)
-  return (
-    <div className='mcpm-card'>
-      <div className='mcpm-card-top'>
-        <span className='mcpm-name'>{server.serverName}</span>
-        <span className='mcpm-badge'>{server.transport === 'stdio' ? 'stdio' : 'http'}</span>
-        <span className={stateClass(server.state)}>{stateLabel(server.state)}</span>
-        <span className='mcpm-meta'>{server.tools.length} 个工具</span>
-        <span className='mcpm-actions'>
-          <button type='button' className='mcpm-switch' data-on={server.enabled} disabled={busy}
-            title={server.enabled ? '停用' : '启用'}
-            onClick={() => onToggle(server)} aria-label={server.enabled ? '停用' : '启用'} />
-          <button type='button' className='mcpm-btn-ghost' disabled={busy} onClick={() => onEdit(server)}>编辑</button>
-          {confirming
-            ? (
-              <>
-                <button type='button' className='mcpm-btn-ghost mcpm-btn-danger' disabled={busy}
-                  onClick={() => onDelete(server)}>确认删除</button>
-                <button type='button' className='mcpm-btn-ghost' disabled={busy} onClick={() => setConfirming(false)}>取消</button>
-              </>
-            )
-            : (
-              <button type='button' className='mcpm-btn-ghost mcpm-btn-danger' disabled={busy}
-                onClick={() => setConfirming(true)}>删除</button>
-            )}
-        </span>
-      </div>
-      {server.error !== undefined && server.error !== '' ? <div className='mcpm-err'>{server.error}</div> : null}
-      {server.tools.length > 0 ? (
-        <button type='button' className='mcpm-btn-ghost' style={{ alignSelf: 'flex-start' }}
-          onClick={() => setExpanded(!expanded)}>
-          {expanded ? '收起工具列表' : `展开工具列表（${String(server.tools.length)}）`}
-        </button>
-      ) : null}
-      {expanded ? (
-        <div className='mcpm-tools'>
-          {server.tools.map(tool => <span key={tool} className='mcpm-tool'>{tool}</span>)}
-        </div>
-      ) : null}
-      {server.transport === 'stdio'
-        ? <div className='mcpm-mono'>{[server.command, ...(server.args ?? [])].join(' ')}</div>
-        : <div className='mcpm-mono'>{server.url}</div>}
-    </div>
-  )
 }
 
 /** Add / edit form. */
@@ -358,43 +430,58 @@ export function McpManageSection(): JSX.Element {
     }
   }
 
-  const toggle = (server: McpServerView): void => {
+  const run = (action: () => Promise<unknown>, okText: string): void => {
     setBusy(true)
-    setServerEnabled(server.id, !server.enabled)
-      .then(result => apply(result, server.enabled ? '已停用' : '已启用'))
-      .catch(e => setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => setBusy(false))
-  }
-
-  const remove = (server: McpServerView): void => {
-    setBusy(true)
-    deleteServer(server.id)
+    action()
       .then(() => {
         refresh()
-        setNotice('已删除')
+        setError('')
+        setNotice(okText)
         clearNoticeSoon()
       })
       .catch(e => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setBusy(false))
   }
 
+  const toggle = (server: McpServerView): void => {
+    run(() => setServerEnabled(server.id, !server.enabled), server.enabled ? '已停用' : '已启用')
+  }
+
+  const remove = (server: McpServerView): void => {
+    run(() => deleteServer(server.id), '已删除')
+  }
+
   const submit = (server: McpServerDef): void => {
-    setBusy(true)
     const done = (): void => {
       setShowForm(false)
       setEditing(null)
     }
     if (editing === null) {
+      setBusy(true)
       addServer(server)
         .then(result => { apply(result, '已添加并加载'); done() })
         .catch(e => setError(e instanceof Error ? e.message : String(e)))
         .finally(() => setBusy(false))
     } else {
+      setBusy(true)
       updateServer(editing.id, server)
         .then(result => { apply(result, '已保存并重启'); done() })
         .catch(e => setError(e instanceof Error ? e.message : String(e)))
         .finally(() => setBusy(false))
     }
+  }
+
+  const toggleExternal = (row: McpExternalServer): void => {
+    run(() => setExternalEnabled(row.entryId, row.override !== 'none'),
+      row.override === 'none' ? '已停用' : '已启用')
+  }
+
+  const deleteExternal = (row: McpExternalServer): void => {
+    run(() => removeExternal(row.entryId), '已移除（可恢复）')
+  }
+
+  const restoreExternalRow = (row: McpExternalServer): void => {
+    run(() => restoreExternal(row.entryId), '已恢复')
   }
 
   return (
@@ -403,7 +490,7 @@ export function McpManageSection(): JSX.Element {
         <h3 className='mcpm-section-head'>MCP 服务器</h3>
         <p className='mcpm-desc'>
           管理接入 DSH 的 MCP 服务器：启用后立即加载为运行实例，工具以 mcp__名称__* 注册到当前会话；
-          停用立即卸载。配置保存在本机，主机重启后自动恢复。
+          停用立即卸载。点击“N 个工具”展开或收起工具列表。配置保存在本机，主机重启后自动恢复。
         </p>
         {snapshot !== null && snapshot.storePath !== '' ? <div className='mcpm-mono'>{snapshot.storePath}</div> : null}
         {error !== '' ? <div className='mcpm-err'>{error}</div> : null}
@@ -429,27 +516,19 @@ export function McpManageSection(): JSX.Element {
       </section>
 
       <section className='mcpm-section'>
-        <h3 className='mcpm-section-head'>来自组合配置的 MCP（只读）</h3>
+        <h3 className='mcpm-section-head'>来自组合配置的 MCP</h3>
         <p className='mcpm-desc'>
-          以下 MCP 工具由 DSH 组合文件（cordis.yml / patch）中的 mcp-client 行提供，不归本页面管理；
-          如需增删请编辑对应的组合配置。
+          以下 MCP 服务器由 DSH 组合文件（cordis.yml / patch）提供，同样可以停用或移除（可恢复）；
+          覆盖状态保存在本机，主机重启后自动维持。源组合文件不会被修改。
         </p>
         {loaded && snapshot !== null && snapshot.external.length === 0
           ? <p className='mcpm-empty'>没有来自组合配置的 MCP 服务器。</p>
           : null}
         {snapshot !== null && snapshot.external.length > 0 ? (
           <div className='mcpm-external'>
-            {snapshot.external.map(group => (
-              <div key={group.serverName} className='mcpm-card'>
-                <div className='mcpm-card-top'>
-                  <span className='mcpm-name'>{group.serverName}</span>
-                  <span className='mcpm-badge mcpm-badge-active'>运行中</span>
-                  <span className='mcpm-meta'>{group.tools.length} 个工具</span>
-                </div>
-                <div className='mcpm-tools'>
-                  {group.tools.map(tool => <span key={tool} className='mcpm-tool'>{tool}</span>)}
-                </div>
-              </div>
+            {snapshot.external.map(row => (
+              <ExternalCard key={row.entryId} row={row} busy={busy}
+                onToggle={toggleExternal} onDelete={deleteExternal} onRestore={restoreExternalRow} />
             ))}
           </div>
         ) : null}

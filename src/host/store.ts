@@ -13,7 +13,7 @@ import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
-import type { McpServerDef, McpServerId } from '../types.ts'
+import type { McpExternalOverride, McpServerDef, McpServerId } from '../types.ts'
 
 /** Same `serverName` budget the generic mcp-client enforces. */
 const SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
@@ -22,6 +22,19 @@ const SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
 interface StoreDocument {
   version: 1
   servers: McpServerDef[]
+  /** Runtime overrides against composition mcp-client rows, keyed by entry id. */
+  overrides?: Record<string, McpExternalOverride>
+}
+
+/** The whole durable store. */
+export interface StoreShape {
+  servers: McpServerDef[]
+  overrides: Record<string, McpExternalOverride>
+}
+
+/** An empty store. */
+export function emptyStore(): StoreShape {
+  return { servers: [], overrides: {} }
 }
 
 /** Resolve the plugin's storage directory under the DSH home. */
@@ -49,12 +62,12 @@ export function mintId(existing: readonly McpServerId[]): McpServerId {
  * unreadable or malformed one throws loud — a present file that cannot parse
  * is a corruption the operator must see, never silently reset.
  */
-export async function loadStore(): Promise<McpServerDef[]> {
+export async function loadStore(): Promise<StoreShape> {
   let text: string
   try {
     text = await readFile(storePath(), 'utf8')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return []
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return emptyStore()
     throw error
   }
   let parsed: unknown
@@ -66,8 +79,8 @@ export async function loadStore(): Promise<McpServerDef[]> {
   return normalizeDocument(parsed)
 }
 
-/** Validate a parsed document into record list, dropping nothing silently. */
-function normalizeDocument(parsed: unknown): McpServerDef[] {
+/** Validate a parsed document into the full store, dropping nothing silently. */
+function normalizeDocument(parsed: unknown): StoreShape {
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     throw new Error(`dsh-mcp-manage: ${storePath()} must hold { version, servers }`)
   }
@@ -81,12 +94,25 @@ function normalizeDocument(parsed: unknown): McpServerDef[] {
       throw new Error(`dsh-mcp-manage: ${storePath()} server ${index + 1}: ${problem}`)
     }
   }
-  return doc.servers
+  const overrides = doc.overrides ?? {}
+  for (const [entryId, override] of Object.entries(overrides)) {
+    if (override?.state !== 'disabled' && override?.state !== 'removed') {
+      throw new Error(`dsh-mcp-manage: ${storePath()} override ${entryId}: state must be "disabled" or "removed"`)
+    }
+    if (override.state === 'removed' && (typeof override.options !== 'object' || override.options === null)) {
+      throw new Error(`dsh-mcp-manage: ${storePath()} override ${entryId}: removed rows must retain their options`)
+    }
+  }
+  return { servers: doc.servers, overrides }
 }
 
 /** Persist the store atomically (tmp file + rename), creating the directory. */
-export async function saveStore(servers: readonly McpServerDef[]): Promise<void> {
-  const document: StoreDocument = { version: 1, servers: [...servers] }
+export async function saveStore(store: StoreShape): Promise<void> {
+  const document: StoreDocument = {
+    version: 1,
+    servers: [...store.servers],
+    overrides: store.overrides,
+  }
   const path = storePath()
   await mkdir(storeDir(), { recursive: true })
   const tmp = `${path}.tmp`

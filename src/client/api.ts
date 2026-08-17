@@ -81,4 +81,22 @@ export async function setServerEnabled(id: string, enabled: boolean): Promise<Mu
   return { server: parsed.server as McpServerView | undefined, startError: parsed.startError as string | undefined }
 }
 
+/** Enable (or disable) one composition-provided MCP row through the loader. */
+export async function setExternalEnabled(entryId: string, enabled: boolean): Promise<McpExternalServer[]> {
+  const parsed = await request('POST', `/external/${encodeURIComponent(entryId)}/enabled`, { enabled })
+  return (parsed.external ?? []) as McpExternalServer[]
+}
+
+/** Remove one composition-provided MCP row (restorable). */
+export async function removeExternal(entryId: string): Promise<McpExternalServer[]> {
+  const parsed = await request('DELETE', `/external/${encodeURIComponent(entryId)}`)
+  return (parsed.external ?? []) as McpExternalServer[]
+}
+
+/** Undo a remove/disable override on one composition-provided row. */
+export async function restoreExternal(entryId: string): Promise<McpExternalServer[]> {
+  const parsed = await request('POST', `/external/${encodeURIComponent(entryId)}/restore`)
+  return (parsed.external ?? []) as McpExternalServer[]
+}
+
 export type { Envelope }

@@ -58,12 +58,24 @@ export interface McpServerView extends McpServerDef {
   tools: string[]
 }
 
-/** One read-only server discovered from the composition (not managed here). */
+/** One composition-provided server, manageable at runtime through overrides. */
 export interface McpExternalServer {
+  /** Loader-tree entry id of the mcp-client row. */
+  entryId: string
   /** Namespace parsed from the `mcp__<serverName>__<tool>` prefix. */
   serverName: string
-  /** Its registered tool names. */
+  /** Override state: none (live), `disabled`, or `removed` (restorable). */
+  override: 'none' | 'disabled' | 'removed'
+  /** Discovered tool names, empty while disabled or removed. */
   tools: string[]
+}
+
+/** One persisted runtime override against a composition mcp-client row. */
+export interface McpExternalOverride {
+  /** `disabled` keeps the row but unmounts it; `removed` drops it (restorable). */
+  state: 'disabled' | 'removed'
+  /** For `removed`: the row's original loader entry options, for restore. */
+  options?: Record<string, unknown>
 }
 
 /** GET /api/dsh-mcp-manage/servers response body. */

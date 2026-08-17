@@ -59,8 +59,8 @@ describe('validate', () => {
 })
 
 describe('store round-trip', () => {
-  it('returns an empty list for a missing document', async () => {
-    await expect(loadStore()).resolves.toEqual([])
+  it('returns an empty store for a missing document', async () => {
+    await expect(loadStore()).resolves.toEqual({ servers: [], overrides: {} })
   })
 
   it('persists and reloads records atomically', async () => {
@@ -69,8 +69,21 @@ describe('store round-trip', () => {
       command: 'node', args: [], env: {}, cwd: '',
       createdAt: 1, updatedAt: 2,
     }
-    await saveStore([record])
-    await expect(loadStore()).resolves.toEqual([record])
+    await saveStore({ servers: [record], overrides: {} })
+    await expect(loadStore()).resolves.toEqual({ servers: [record], overrides: {} })
+  })
+
+  it('round-trips external overrides', async () => {
+    await saveStore({
+      servers: [],
+      overrides: {
+        'mcp-x': { state: 'disabled' },
+        'mcp-y': { state: 'removed', options: { id: 'mcp-y', name: '@deepseek-ai/dsh-mcp-client' } },
+      },
+    })
+    const store = await loadStore()
+    expect(store.overrides['mcp-x']).toEqual({ state: 'disabled' })
+    expect(store.overrides['mcp-y']?.state).toBe('removed')
   })
 
   it('throws loud on a malformed document', async () => {

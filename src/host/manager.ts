@@ -11,10 +11,47 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { McpExternalServer, McpRuntimeState, McpServerDef, McpServerView } from '../types.ts'
+import type {
+  McpExternalOverride, McpExternalServer, McpRuntimeState, McpServerDef, McpServerView,
+} from '../types.ts'
 
 /** Public tool-name prefix the generic mcp-client registers under. */
 const MCP_TOOL_PREFIX = /^mcp__([A-Za-z0-9_-]{1,64})__(.+)$/
+
+/** Package name of the generic mcp-client rows in a composition. */
+const MCP_CLIENT_PACKAGE = '@deepseek-ai/dsh-mcp-client'
+
+/** Structural face of one vendored-Loader entry row. */
+interface LoaderEntry {
+  /** Path-qualified id (nested trees join segments with ':'). */
+  id: string
+  disabled: boolean
+  options: { id: string; name?: unknown; config?: unknown; disabled?: unknown }
+  parent: LoaderGroup
+  /** Merge options and restart as needed — does NOT persist to disk. */
+  update(options: Record<string, unknown>): Promise<void>
+}
+
+/** Structural face of one loader entry group. */
+interface LoaderGroup {
+  /** The group's serialized row list; a restored row must join it or the next
+   * reconciliation (config reload) drops it again. */
+  data: Array<Record<string, unknown>>
+  create(options: Record<string, unknown>): Promise<string>
+  remove(id: string): Promise<void>
+}
+
+/** Structural face of one loader entry tree. */
+interface LoaderTree {
+  import(name: string): Promise<unknown>
+  root: LoaderGroup
+}
+
+/** Structural face of the vendored Loader service (4.0.1 typings omit it). */
+interface LoaderFace {
+  entries(): Iterable<LoaderEntry>
+  resolve(id: string): LoaderEntry
+}
 
 /** Structural face of the generic mcp-client plugin this manager loads. */
 interface McpClientModule {
@@ -25,7 +62,7 @@ interface McpClientModule {
 
 /** The vendor loader declaration-merges `entry` onto Fiber; 4.0.1 typings predate it. */
 interface EntryCarrier {
-  entry?: { parent?: { tree?: { import: (name: string) => Promise<unknown> } } }
+  entry?: { parent?: { tree?: LoaderTree } }
 }
 
 /** What `ctx.plugin()` hands back for one loaded instance. */
@@ -55,6 +92,22 @@ export class McpManager {
   private module: McpClientModule | undefined
   /** In-flight import so concurrent starts share one attempt. */
   private importing: Promise<McpClientModule> | undefined
+  /**
+   * Set while an explicit mutation (restore) is settling. The loader emits
+   * `entry-init` re-entrantly inside `group.create`, and the enforcement hook
+   * must not read a stale override store and undo the very row being built.
+   */
+  private mutating = false
+
+  /** Run `task` with enforcement suspended (explicit mutations own ordering). */
+  async withMutation<T>(task: () => Promise<T>): Promise<T> {
+    this.mutating = true
+    try {
+      return await task()
+    } finally {
+      this.mutating = false
+    }
+  }
 
   constructor(private readonly ctx: Context) {}
 
@@ -199,9 +252,11 @@ export class McpManager {
 
   /**
    * Project the record list into view rows: managed state plus discovered
-   * tools, and the composition-configured servers this plugin does not own.
+   * tools, and the composition-configured servers this plugin does not own
+   * (with their persisted override state).
    */
-  views(servers: readonly McpServerDef[]): { managed: McpServerView[]; external: McpExternalServer[] } {
+  views(servers: readonly McpServerDef[], overrides: Readonly<Record<string, McpExternalOverride>> = {}):
+    { managed: McpServerView[]; external: McpExternalServer[] } {
     const groups = this.toolsByServer()
     const managed = servers.map((def): McpServerView => {
       const instance = this.live.get(def.id)
@@ -216,12 +271,130 @@ export class McpManager {
     })
     const mine = new Set(servers.map(def => def.serverName))
     const external: McpExternalServer[] = []
-    for (const [serverName, tools] of groups) {
-      if (mine.has(serverName)) continue
-      external.push({ serverName, tools })
+    for (const row of this.externalEntries()) {
+      if (mine.has(row.serverName)) continue
+      const stored = overrides[row.entryId]
+      const override: McpExternalServer['override'] = stored === undefined ? 'none' : stored.state
+      external.push({
+        entryId: row.entryId,
+        serverName: row.serverName,
+        override,
+        tools: override === 'none' ? groups.get(row.serverName) ?? [] : [],
+      })
+    }
+    // Removed rows are absent from the loader; surface them from the overrides
+    // so the UI can offer restore.
+    const present = new Set(external.map(row => row.entryId))
+    for (const [entryId, override] of Object.entries(overrides)) {
+      if (override.state !== 'removed' || present.has(entryId)) continue
+      const name = (override.options?.config as { serverName?: unknown } | undefined)?.serverName
+      if (typeof name !== 'string') continue
+      if (mine.has(name)) continue
+      external.push({ entryId, serverName: name, override: 'removed', tools: [] })
     }
     external.sort((a, b) => a.serverName < b.serverName ? -1 : 1)
     return { managed, external }
+  }
+
+  // ---- composition (external) mcp-client rows, managed through the loader ----
+
+  /** Structural face of the vendored Loader service (4.0.1 typings omit it). */
+  private loaderFace(): LoaderFace | undefined {
+    return this.ctx.get('loader') as LoaderFace | undefined
+  }
+
+  /**
+   * Every composition mcp-client row currently in the loader tree.
+   * Entries created by this manager's own instances carry no loader row.
+   */
+  externalEntries(): Array<{ entryId: string; serverName: string; disabled: boolean }> {
+    const loader = this.loaderFace()
+    if (loader === undefined) return []
+    const rows: Array<{ entryId: string; serverName: string; disabled: boolean }> = []
+    for (const entry of loader.entries()) {
+      if (entry.options.name !== MCP_CLIENT_PACKAGE) continue
+      const serverName = (entry.options.config as { serverName?: unknown } | undefined)?.serverName
+      if (typeof serverName !== 'string') continue
+      rows.push({ entryId: entry.id, serverName, disabled: entry.disabled })
+    }
+    return rows
+  }
+
+  /**
+   * Disable (or re-enable) one composition row. Runs through the entry's own
+   * `update`, which mounts/disposes the fiber WITHOUT persisting to the
+   * composition file — this plugin's store is the single persistence for
+   * overrides, so a user-patch HMR reload that resets rows is re-enforced
+   * from here instead of fighting a materialized write-back.
+   */
+  async setExternalEnabled(entryId: string, enabled: boolean): Promise<void> {
+    const entry = this.resolveExternal(entryId)
+    await entry.update({ disabled: enabled ? null : true })
+  }
+
+  /** Remove one composition row, returning its options for a later restore. */
+  async removeExternal(entryId: string): Promise<Record<string, unknown>> {
+    const entry = this.resolveExternal(entryId)
+    const options = structuredClone(entry.options) as unknown as Record<string, unknown>
+    // group.remove stops the fiber and unlinks the row; the disk file is
+    // deliberately untouched (see setExternalEnabled).
+    await entry.parent.remove(entry.options.id)
+    return options
+  }
+
+  /** Re-create a previously removed composition row in its original tree. */
+  async restoreExternal(options: Record<string, unknown>): Promise<string> {
+    const loader = this.loaderFace()
+    const tree = (this.ctx.fiber as unknown as EntryCarrier).entry?.parent?.tree
+    const group = tree?.root
+    if (loader === undefined || group === undefined) throw new Error('loader entry tree unavailable')
+    const id = await group.create(options)
+    // Mirror EntryTree.create's bookkeeping (minus the disk write): the row
+    // must sit in the group's data list or the next reconciliation drops it.
+    let created: Record<string, unknown> | undefined
+    try {
+      created = loader.resolve(id).options as unknown as Record<string, unknown>
+    } catch {
+      created = undefined
+    }
+    if (created !== undefined && !group.data.includes(created)) group.data.push(created)
+    return id
+  }
+
+  /** Resolve one composition row or throw the loader's own not-found error. */
+  private resolveExternal(entryId: string): LoaderEntry {
+    const loader = this.loaderFace()
+    if (loader === undefined) throw new Error('loader service unavailable')
+    return loader.resolve(entryId)
+  }
+
+  /**
+   * Idempotently apply persisted overrides against the live tree. Converging
+   * by observation (is the row already in the desired state?) keeps repeated
+   * calls — boot entry-init events, config reloads, list reads — free of
+   * side effects.
+   */
+  async enforceOverrides(overrides: Readonly<Record<string, McpExternalOverride>>): Promise<void> {
+    if (this.mutating) return
+    const loader = this.loaderFace()
+    if (loader === undefined) return
+    for (const [entryId, override] of Object.entries(overrides)) {
+      let entry: LoaderEntry | undefined
+      try {
+        entry = loader.resolve(entryId)
+      } catch {
+        entry = undefined
+      }
+      try {
+        if (override.state === 'disabled' && entry !== undefined && !entry.disabled) {
+          await entry.update({ disabled: true })
+        } else if (override.state === 'removed' && entry !== undefined) {
+          await entry.parent.remove(entry.options.id)
+        }
+      } catch (error) {
+        this.ctx.logger.warn(`dsh-mcp-manage: override ${entryId}: ${String(error)}`)
+      }
+    }
   }
 
   /** Dispose every live instance (plugin teardown). */
