@@ -79,12 +79,12 @@
     "plugin"
   ],
   "license": "MIT",
-  "homepage": "https://github.com/huanghai-lab/dsh-mcp-manage#readme",
+  "homepage": "https://github.com/null119/dsh-mcp-manage#readme",
   "bugs": {
-    "url": "https://github.com/huanghai-lab/dsh-mcp-manage/issues"
+    "url": "https://github.com/null119/dsh-mcp-manage/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/huanghai-lab/dsh-mcp-manage.git"
+    "url": "git+https://github.com/null119/dsh-mcp-manage.git"
   }
 }
