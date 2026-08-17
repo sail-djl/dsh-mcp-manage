@@ -37,7 +37,8 @@
     "bundle": "tsdown",
     "watch": "tsdown --watch",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepare": "pnpm run build"
   },
   "peerDependencies": {
     "react": "^18.2.0"
