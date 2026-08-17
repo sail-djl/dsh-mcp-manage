@@ -1,0 +1,91 @@
+/**
+ * Unit tests for the MCP-management host store: validation, id minting,
+ * and document round-tripping. Runs against a temporary DSH_HOME so the
+ * operator's real store is never touched.
+ */
+
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { loadStore, mintId, saveStore, storePath, validate } from '../src/host/store.ts'
+
+let home: string
+
+beforeAll(async () => {
+  home = await mkdtemp(join(tmpdir(), 'mcp-manage-test-'))
+  process.env.DSH_HOME = home
+})
+
+afterAll(async () => {
+  await rm(home, { recursive: true, force: true })
+})
+
+describe('validate', () => {
+  it('accepts a stdio definition', () => {
+    expect(validate({
+      serverName: 'adb', transport: 'stdio', command: 'node',
+      args: ['x'], env: { A: 'b' }, cwd: '',
+    })).toBeUndefined()
+  })
+
+  it('accepts a streamable-http definition', () => {
+    expect(validate({
+      serverName: 'remote', transport: 'streamable-http', url: 'http://127.0.0.1:3000/mcp',
+      headers: { Authorization: 'Bearer x' },
+    })).toBeUndefined()
+  })
+
+  it('rejects a malformed serverName', () => {
+    expect(validate({ serverName: 'has space', transport: 'stdio', command: 'x' }))
+      .toMatch(/serverName/)
+    expect(validate({ serverName: 'x'.repeat(33), transport: 'stdio', command: 'x' }))
+      .toMatch(/serverName/)
+  })
+
+  it('rejects stdio without a command', () => {
+    expect(validate({ serverName: 'a', transport: 'stdio' })).toMatch(/command/)
+  })
+
+  it('rejects http without an http(s) url', () => {
+    expect(validate({ serverName: 'a', transport: 'streamable-http', url: 'ftp://x' })).toMatch(/url/)
+  })
+
+  it('rejects a relative cwd and a non-positive timeout', () => {
+    expect(validate({ serverName: 'a', transport: 'stdio', command: 'x', cwd: 'rel/path' })).toMatch(/cwd/)
+    expect(validate({ serverName: 'a', transport: 'stdio', command: 'x', toolCallTimeoutMs: 0 }))
+      .toMatch(/toolCallTimeoutMs/)
+  })
+})
+
+describe('store round-trip', () => {
+  it('returns an empty list for a missing document', async () => {
+    await expect(loadStore()).resolves.toEqual([])
+  })
+
+  it('persists and reloads records atomically', async () => {
+    const record = {
+      id: mintId([]), serverName: 'echo', transport: 'stdio' as const, enabled: true,
+      command: 'node', args: [], env: {}, cwd: '',
+      createdAt: 1, updatedAt: 2,
+    }
+    await saveStore([record])
+    await expect(loadStore()).resolves.toEqual([record])
+  })
+
+  it('throws loud on a malformed document', async () => {
+    await writeFile(storePath(), '{ not json', 'utf8')
+    await expect(loadStore()).rejects.toThrow(/cannot parse/)
+    await writeFile(storePath(), '{"version": 2, "servers": []}', 'utf8')
+    await expect(loadStore()).rejects.toThrow(/version: 1/)
+  })
+})
+
+describe('mintId', () => {
+  it('never collides with the provided existing ids', () => {
+    const existing = Array.from({ length: 100 }, () => mintId([]))
+    const one = mintId(existing)
+    expect(existing).not.toContain(one)
+    expect(one).toMatch(/^srv-[0-9a-f]{8}$/)
+  })
+})
