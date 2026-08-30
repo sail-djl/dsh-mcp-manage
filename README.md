@@ -45,6 +45,26 @@ dsh plugin --profile web remove dsh-mcp-manage
 - **client 半**（`src/client/`）：通过 `dsh.client` 声明加载到 Web GUI，向 `settings.section` 槽位注册 "MCP 管理" 导航页，纯 `fetch` 与 host 半通信。
 - 工具枚举读取 `ctx.tools.schemas()` 中所有 `mcp__*` 前缀的名字，按 `serverName` 分组——这就是“当前宿主已安装的全部 MCP 工具”的权威列表。
 
+## dsh.bundle 声明清单
+
+本插件在 package.json 的 `dsh` 段声明双面 bundle，该清单是 `dsh plugin` 与 Web GUI 识别并加载本插件的依据：
+
+```json
+"dsh": {
+  "bundle": { "patch": "./cordis.patch.yml" },
+  "client": {
+    "inject": [
+      "@deepseek-ai/dsh-client-runtime",
+      "@deepseek-ai/dsh-client-ui-settings"
+    ],
+    "platform": "web"
+  }
+}
+```
+
+- **`dsh.bundle.patch`**：bundle 对外导出的组合 patch 层（相对包根的路径）。`dsh plugin --profile <name> add` 据此把本包识别为可安装插件——安装后以补丁层加入该 profile 的 `dsh.profile.bundles` 叠层栈；未声明 `dsh.bundle` 的包只会作为普通依赖安装（伴随告警），不成为任何一层。
+- **`dsh.client`**：浏览器半声明。`inject` 列出加载 client 包前需先注入的对等包（运行时与设置页 UI），`platform: "web"` 声明目标平台。
+
 ## HTTP API
 
 页面之外，路由族也可直接调用（同源前缀 `/api/dsh-mcp-manage`，统一 JSON 信封 `{ ok, error? }`）：
@@ -115,6 +135,26 @@ Restart `dsh web`, then open **Settings → MCP 管理**. Requires DSH ≥ `0.1.
 ## How it works
 
 The host half serves `/api/dsh-mcp-manage/*` on `ctx.webServer` and loads each enabled record as an `@deepseek-ai/dsh-mcp-client` instance (an effect-scoped child of this plugin's fiber — disposal cascades automatically; the client package resolves from the running dsh installation as an optional peer). The browser half registers the settings page through the `settings.section` slot and talks to the host over plain fetch. Tool enumeration reads `ctx.tools.schemas()` and groups every `mcp__*` name by server namespace. Composition rows are managed through the loader's `Entry.update` / `group.remove` (bypassing `tree.write()` — nothing is materialized back into the source composition files): the enable toggle and the runtime config edit (`PUT /external/:entryId/config`, a payload shaped like the managed edit, mapped through the same `toConfig`) both restart the row's fiber immediately, the original loader options are snapshotted on first edit for revert (`POST /external/:entryId/revert`), and persisted overrides are re-enforced after boot and hot reloads via the `loader/entry-init` / `loader/config-update` hooks.
+
+## dsh.bundle manifest
+
+The plugin declares its dual-face bundle in the `dsh` section of package.json — this manifest is what `dsh plugin` and the web GUI rely on to recognize and load the plugin:
+
+```json
+"dsh": {
+  "bundle": { "patch": "./cordis.patch.yml" },
+  "client": {
+    "inject": [
+      "@deepseek-ai/dsh-client-runtime",
+      "@deepseek-ai/dsh-client-ui-settings"
+    ],
+    "platform": "web"
+  }
+}
+```
+
+- **`dsh.bundle.patch`**: the composition patch layer the bundle exports (relative to the package root). `dsh plugin --profile <name> add` uses it to recognize the package as an installable plugin — once installed, it joins that profile's `dsh.profile.bundles` layer stack as a patch layer; a package without a `dsh.bundle` declaration installs as a plain dependency (with a warning) and never becomes a layer.
+- **`dsh.client`**: the browser-half declaration. `inject` lists the peer packages that must load before the client bundle (the runtime and the settings-page UI), and `platform: "web"` declares the target platform.
 
 ## HTTP API
 
