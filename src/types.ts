@@ -64,18 +64,22 @@ export interface McpExternalServer {
   entryId: string
   /** Namespace parsed from the `mcp__<serverName>__<tool>` prefix. */
   serverName: string
-  /** Override state: none (live), `disabled`, or `removed` (restorable). */
-  override: 'none' | 'disabled' | 'removed'
+  /** Override state: none (live), `modified` (live, edited config), `disabled`, or `removed` (restorable). */
+  override: 'none' | 'modified' | 'disabled' | 'removed'
   /** Discovered tool names, empty while disabled or removed. */
   tools: string[]
+  /** Effective mcp-client config of the row (edit-form prefill); may be absent. */
+  config?: Record<string, unknown>
 }
 
 /** One persisted runtime override against a composition mcp-client row. */
 export interface McpExternalOverride {
-  /** `disabled` keeps the row but unmounts it; `removed` drops it (restorable). */
-  state: 'disabled' | 'removed'
-  /** For `removed`: the row's original loader entry options, for restore. */
+  /** `disabled` keeps the row but unmounts it; `modified` replaces its config; `removed` drops it (restorable). */
+  state: 'disabled' | 'removed' | 'modified'
+  /** The row's original loader entry options — for restore (`removed` rows) or config revert (`modified`). */
   options?: Record<string, unknown>
+  /** Replacement mcp-client config (`modified` rows; also carried on `disabled` so an edit survives the toggle). */
+  config?: Record<string, unknown>
 }
 
 /** GET /api/dsh-mcp-manage/servers response body. */

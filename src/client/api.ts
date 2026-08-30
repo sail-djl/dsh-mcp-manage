@@ -99,4 +99,16 @@ export async function restoreExternal(entryId: string): Promise<McpExternalServe
   return (parsed.external ?? []) as McpExternalServer[]
 }
 
+/** Replace one composition row's mcp-client config (runtime edit). */
+export async function updateExternalConfig(entryId: string, server: McpServerDef): Promise<McpExternalServer[]> {
+  const parsed = await request('PUT', `/external/${encodeURIComponent(entryId)}/config`, { server })
+  return (parsed.external ?? []) as McpExternalServer[]
+}
+
+/** Revert one composition row's runtime config edit to its original options. */
+export async function revertExternalConfig(entryId: string): Promise<McpExternalServer[]> {
+  const parsed = await request('POST', `/external/${encodeURIComponent(entryId)}/revert`)
+  return (parsed.external ?? []) as McpExternalServer[]
+}
+
 export type { Envelope }

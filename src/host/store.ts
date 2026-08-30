@@ -37,6 +37,26 @@ export function emptyStore(): StoreShape {
   return { servers: [], overrides: {} }
 }
 
+/**
+ * The override a composition row carries across an enable/disable toggle or
+ * a restore. A runtime config edit (`config`, with the row's original loader
+ * `options` kept for revert) must survive both directions of the toggle —
+ * disabling keeps it dormant, re-enabling brings it back as `modified`.
+ * A row with no edit keeps the historical bare shapes (`disabled` toggle /
+ * deleted on enable), so nothing changes for rows the user never edited.
+ */
+export function carriedOverride(
+  prior: McpExternalOverride | undefined,
+  state: 'disabled' | 'modified',
+): McpExternalOverride | undefined {
+  if (prior?.config === undefined) return state === 'modified' ? undefined : { state }
+  return {
+    state,
+    config: prior.config,
+    ...(prior.options !== undefined ? { options: prior.options } : {}),
+  }
+}
+
 /** Resolve the plugin's storage directory under the DSH home. */
 export function storeDir(): string {
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
@@ -96,11 +116,17 @@ function normalizeDocument(parsed: unknown): StoreShape {
   }
   const overrides = doc.overrides ?? {}
   for (const [entryId, override] of Object.entries(overrides)) {
-    if (override?.state !== 'disabled' && override?.state !== 'removed') {
-      throw new Error(`dsh-mcp-manage: ${storePath()} override ${entryId}: state must be "disabled" or "removed"`)
+    if (override?.state !== 'disabled' && override?.state !== 'removed' && override?.state !== 'modified') {
+      throw new Error(`dsh-mcp-manage: ${storePath()} override ${entryId}: state must be "disabled", "modified" or "removed"`)
     }
     if (override.state === 'removed' && (typeof override.options !== 'object' || override.options === null)) {
       throw new Error(`dsh-mcp-manage: ${storePath()} override ${entryId}: removed rows must retain their options`)
+    }
+    if (override.state === 'modified' && (typeof override.config !== 'object' || override.config === null)) {
+      throw new Error(`dsh-mcp-manage: ${storePath()} override ${entryId}: modified rows must retain the edited config`)
+    }
+    if (override.config !== undefined && (typeof override.config !== 'object' || override.config === null)) {
+      throw new Error(`dsh-mcp-manage: ${storePath()} override ${entryId}: config must be an object`)
     }
   }
   return { servers: doc.servers, overrides }

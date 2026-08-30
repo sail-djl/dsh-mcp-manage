@@ -19,7 +19,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { McpExternalOverride, McpServerDef } from './types.ts'
-import { loadStore, mintId, saveStore, storePath, validate, type StoreShape } from './host/store.ts'
+import { carriedOverride, loadStore, mintId, saveStore, storePath, validate, type StoreShape } from './host/store.ts'
 import { McpManager } from './host/manager.ts'
 
 /** Route prefix for this plugin's JSON operations. */
@@ -109,8 +109,10 @@ function normalizeServer(payload: unknown):
  * Whether `serverName` collides with another record (edit) or any record
  * (add). Server-name uniqueness is the generic client's hard namespace
  * requirement; refusing here beats failing the fiber later.
+ * `exceptId` skips one managed record (managed edit), `exceptEntryId` skips
+ * one loader row (external config edit).
  */
-function nameCollision(store: StoreShape, serverName: string, exceptId?: string): boolean {
+function nameCollision(store: StoreShape, serverName: string, exceptId?: string, exceptEntryId?: string): boolean {
   if (store.servers.some(other => other.serverName === serverName && other.id !== exceptId)) return true
   // A live composition row owns its serverName too, unless overridden away.
   const overridden = (entryId: string): boolean => {
@@ -118,7 +120,9 @@ function nameCollision(store: StoreShape, serverName: string, exceptId?: string)
     return state === 'disabled' || state === 'removed'
   }
   return managerRef?.externalEntries().some(row =>
-    row.serverName === serverName && !overridden(row.entryId)) ?? false
+    row.entryId !== exceptEntryId
+    && row.serverName === serverName
+    && !overridden(row.entryId)) ?? false
 }
 
 /** Late-bound manager for collision checks (set once in apply). */
@@ -149,13 +153,17 @@ function registerRoutes(ctx: Context, manager: McpManager): () => void {
         return
       }
 
-      // ── composition rows: enable toggle / remove / restore ─────────────
+      // ── composition rows: enable toggle / edit config / revert / remove /
+      //    restore ─────────────────────────────────────────────────────────
       if (sub === 'external' && segments.length >= 2) {
         const entryId = segments[1]
         const action = segments[2] ?? ''
         const store = await loadStore()
 
         // POST /external/:entryId/enabled — enable or disable the loader row.
+        // A stored config edit rides along: disable keeps it dormant,
+        // re-enable restores it as `modified` (rows never edited keep the
+        // historical bare shapes).
         if (req.method === 'POST' && action === 'enabled') {
           const body = await parseJsonBody<{ enabled?: unknown }>(req)
           if (body === undefined || typeof body.enabled !== 'boolean') {
@@ -163,10 +171,95 @@ function registerRoutes(ctx: Context, manager: McpManager): () => void {
             return
           }
           await manager.setExternalEnabled(entryId, body.enabled)
+          const prior = store.overrides[entryId]
           const next = { ...store.overrides }
-          if (body.enabled) delete next[entryId]
-          else next[entryId] = { state: 'disabled' }
+          if (body.enabled) {
+            const carried = carriedOverride(prior, 'modified')
+            if (carried !== undefined) next[entryId] = carried
+            else delete next[entryId]
+          } else {
+            next[entryId] = carriedOverride(prior, 'disabled')!
+          }
           await saveStore({ ...store, overrides: next })
+          const { external } = manager.views(store.servers, next)
+          json(res, { ok: true, external })
+          return
+        }
+
+        // PUT /external/:entryId/config — replace the row's mcp-client
+        // config from an edit form. The body is a server definition shaped
+        // like the managed PUT; it is mapped through the manager's own
+        // toConfig so a config the boot path would load is by construction
+        // acceptable here. The row restarts under the new config when live,
+        // or keeps it dormant when disabled; the edit persists as a
+        // `modified` / `disabled` override and is re-enforced after every
+        // reload. The original loader options are snapshotted on the first
+        // edit so `revert` can always walk the row back.
+        if (req.method === 'PUT' && action === 'config') {
+          const row = manager.externalEntries().find(entry => entry.entryId === entryId)
+          if (row === undefined) {
+            json(res, { ok: false, error: 'entry not found (removed rows must be restored first)' }, 404)
+            return
+          }
+          const body = await parseJsonBody<{ server?: unknown }>(req)
+          if (body === undefined) { json(res, { ok: false, error: 'invalid JSON body' }, 400); return }
+          const { server, problem } = normalizeServer(body.server)
+          if (server === undefined) { json(res, { ok: false, error: problem }, 400); return }
+          if (nameCollision(store, server.serverName, undefined, entryId)) {
+            json(res, { ok: false, error: `serverName "${server.serverName}" is already in use` }, 409)
+            return
+          }
+          const prior = store.overrides[entryId]
+          const options = prior?.options ?? manager.cloneExternalOptions(entryId)
+          const config = manager.toConfig(server)
+          // Fields the edit form does not model (failOnStartupError) must
+          // not be silently reset by the edit — carry the row's original.
+          const originalConfig = typeof options.config === 'object' && options.config !== null
+            ? options.config as Record<string, unknown>
+            : undefined
+          if (typeof originalConfig?.failOnStartupError === 'boolean') {
+            config.failOnStartupError = originalConfig.failOnStartupError
+          }
+          const state = prior?.state === 'disabled' || row.disabled ? 'disabled' as const : 'modified' as const
+          await manager.updateExternalConfig(entryId, config)
+          const next = { ...store.overrides, [entryId]: { state, config, options } }
+          await saveStore({ ...store, overrides: next })
+          const { external } = manager.views(store.servers, next)
+          json(res, { ok: true, external })
+          return
+        }
+
+        // POST /external/:entryId/revert — undo a config edit: a live row
+        // returns to its original loader options; a disabled row's config
+        // reverts while it stays dormant. Nothing to revert is a 404.
+        if (req.method === 'POST' && action === 'revert') {
+          const override = store.overrides[entryId]
+          const options = override?.options
+          if (override === undefined || override.config === undefined
+            || typeof options !== 'object' || options === null) {
+            json(res, { ok: false, error: 'nothing to revert' }, 404)
+            return
+          }
+          const originalConfig = typeof options.config === 'object' && options.config !== null
+            ? options.config as Record<string, unknown>
+            : undefined
+          if (originalConfig === undefined) {
+            json(res, { ok: false, error: 'original config unavailable' }, 409)
+            return
+          }
+          const next = { ...store.overrides }
+          if (override.state === 'disabled') next[entryId] = { state: 'disabled', options }
+          else delete next[entryId]
+          // Persist BEFORE the mutation: entry.update emits entry-init
+          // re-entrantly and enforcement must not re-read a stale override.
+          await saveStore({ ...store, overrides: next })
+          await manager.withMutation(async () => {
+            if (override.state === 'disabled') {
+              await manager.updateExternalConfig(entryId, structuredClone(originalConfig))
+            } else {
+              await manager.revertExternal(entryId, structuredClone(options))
+            }
+          })
           const { external } = manager.views(store.servers, next)
           json(res, { ok: true, external })
           return
@@ -189,22 +282,28 @@ function registerRoutes(ctx: Context, manager: McpManager): () => void {
         }
 
         // POST /external/:entryId/restore — undo remove/disable. The store
-        // drops the override BEFORE the row is re-created: group.create emits
-        // entry-init re-entrantly, and enforcement must not see the stale
-        // override it is about to remove.
+        // drops (or re-arms, for edited rows) the override BEFORE the row is
+        // re-created: group.create emits entry-init re-entrantly, and
+        // enforcement must not see the stale override it is about to remove.
         if (req.method === 'POST' && action === 'restore') {
           const override: McpExternalOverride | undefined = store.overrides[entryId]
           if (override === undefined) { json(res, { ok: false, error: 'no override to restore' }, 404); return }
           const next = { ...store.overrides }
-          delete next[entryId]
-          await saveStore({ ...store, overrides: next })
-          await manager.withMutation(async () => {
-            if (override.state === 'removed' && override.options !== undefined) {
-              await manager.restoreExternal(override.options)
-            } else {
+          if (override.state === 'removed' && override.options !== undefined) {
+            delete next[entryId]
+            await saveStore({ ...store, overrides: next })
+            await manager.withMutation(async () => {
+              await manager.restoreExternal(override.options!)
+            })
+          } else {
+            const carried = carriedOverride(override, 'modified')
+            if (carried !== undefined) next[entryId] = carried
+            else delete next[entryId]
+            await saveStore({ ...store, overrides: next })
+            await manager.withMutation(async () => {
               await manager.setExternalEnabled(entryId, true)
-            }
-          })
+            })
+          }
           const { external } = manager.views(store.servers, next)
           json(res, { ok: true, external })
           return

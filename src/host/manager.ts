@@ -53,6 +53,30 @@ interface LoaderFace {
   resolve(id: string): LoaderEntry
 }
 
+/** Read one entry's mcp-client config object (undefined when absent). */
+function configOf(entry: LoaderEntry): Record<string, unknown> | undefined {
+  const config = entry.options.config
+  return typeof config === 'object' && config !== null ? config as Record<string, unknown> : undefined
+}
+
+/** Structural deep equality for plain config objects (override enforcement). */
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== typeof b || a === null || b === null) return false
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return Array.isArray(a) && Array.isArray(b)
+      && a.length === b.length && a.every((item, index) => deepEqual(item, b[index]))
+  }
+  if (typeof a === 'object') {
+    const left = a as Record<string, unknown>
+    const right = b as Record<string, unknown>
+    const keys = Object.keys(left)
+    return keys.length === Object.keys(right).length
+      && keys.every(key => Object.prototype.hasOwnProperty.call(right, key) && deepEqual(left[key], right[key]))
+  }
+  return false
+}
+
 /** Structural face of the generic mcp-client plugin this manager loads. */
 interface McpClientModule {
   name: string
@@ -148,8 +172,13 @@ export class McpManager {
     }
   }
 
-  /** Translate one record into the generic client's config shape. */
-  private toConfig(def: McpServerDef): Record<string, unknown> {
+  /**
+   * Translate one record into the generic client's config shape. Public:
+   * the external-config edit route maps a client-submitted definition
+   * through the exact same mapping the boot path uses, so a config this
+   * manager would load itself is by construction acceptable to the row.
+   */
+  toConfig(def: McpServerDef): Record<string, unknown> {
     if (def.transport === 'stdio') {
       return {
         transport: 'stdio',
@@ -279,7 +308,8 @@ export class McpManager {
         entryId: row.entryId,
         serverName: row.serverName,
         override,
-        tools: override === 'none' ? groups.get(row.serverName) ?? [] : [],
+        tools: override === 'none' || override === 'modified' ? groups.get(row.serverName) ?? [] : [],
+        config: stored?.config ?? row.config,
       })
     }
     // Removed rows are absent from the loader; surface them from the overrides
@@ -287,10 +317,11 @@ export class McpManager {
     const present = new Set(external.map(row => row.entryId))
     for (const [entryId, override] of Object.entries(overrides)) {
       if (override.state !== 'removed' || present.has(entryId)) continue
-      const name = (override.options?.config as { serverName?: unknown } | undefined)?.serverName
+      const config = override.options?.config as Record<string, unknown> | undefined
+      const name = config?.serverName
       if (typeof name !== 'string') continue
       if (mine.has(name)) continue
-      external.push({ entryId, serverName: name, override: 'removed', tools: [] })
+      external.push({ entryId, serverName: name, override: 'removed', tools: [], config })
     }
     external.sort((a, b) => a.serverName < b.serverName ? -1 : 1)
     return { managed, external }
@@ -307,15 +338,16 @@ export class McpManager {
    * Every composition mcp-client row currently in the loader tree.
    * Entries created by this manager's own instances carry no loader row.
    */
-  externalEntries(): Array<{ entryId: string; serverName: string; disabled: boolean }> {
+  externalEntries(): Array<{ entryId: string; serverName: string; disabled: boolean; config?: Record<string, unknown> }> {
     const loader = this.loaderFace()
     if (loader === undefined) return []
-    const rows: Array<{ entryId: string; serverName: string; disabled: boolean }> = []
+    const rows: Array<{ entryId: string; serverName: string; disabled: boolean; config?: Record<string, unknown> }> = []
     for (const entry of loader.entries()) {
       if (entry.options.name !== MCP_CLIENT_PACKAGE) continue
-      const serverName = (entry.options.config as { serverName?: unknown } | undefined)?.serverName
+      const config = configOf(entry)
+      const serverName = config?.serverName
       if (typeof serverName !== 'string') continue
-      rows.push({ entryId: entry.id, serverName, disabled: entry.disabled })
+      rows.push({ entryId: entry.id, serverName, disabled: entry.disabled, config })
     }
     return rows
   }
@@ -330,6 +362,28 @@ export class McpManager {
   async setExternalEnabled(entryId: string, enabled: boolean): Promise<void> {
     const entry = this.resolveExternal(entryId)
     await entry.update({ disabled: enabled ? null : true })
+  }
+
+  /** Clone one composition row's current loader options (pre-edit snapshot). */
+  cloneExternalOptions(entryId: string): Record<string, unknown> {
+    const entry = this.resolveExternal(entryId)
+    return structuredClone(entry.options) as unknown as Record<string, unknown>
+  }
+
+  /**
+   * Replace one composition row's mcp-client config and restart it. Like the
+   * enable toggle this does not touch the composition file — the caller
+   * persists the edited config as a `modified` override in the record store.
+   */
+  async updateExternalConfig(entryId: string, config: Record<string, unknown>): Promise<void> {
+    const entry = this.resolveExternal(entryId)
+    await entry.update({ config })
+  }
+
+  /** Revert one composition row to its original options (undo a config edit). */
+  async revertExternal(entryId: string, options: Record<string, unknown>): Promise<void> {
+    const entry = this.resolveExternal(entryId)
+    await entry.update(structuredClone(options))
   }
 
   /** Remove one composition row, returning its options for a later restore. */
@@ -386,10 +440,22 @@ export class McpManager {
         entry = undefined
       }
       try {
-        if (override.state === 'disabled' && entry !== undefined && !entry.disabled) {
-          await entry.update({ disabled: true })
-        } else if (override.state === 'removed' && entry !== undefined) {
-          await entry.parent.remove(entry.options.id)
+        if (override.state === 'removed') {
+          if (entry !== undefined) await entry.parent.remove(entry.options.id)
+          continue
+        }
+        if (entry === undefined) continue
+        // Config convergence applies to both `modified` (live) and `disabled`
+        // rows: an edit made while the row was disabled must still be waiting
+        // in the tree when the row is later re-enabled.
+        const wantConfig = override.config
+        const configDiffers = wantConfig !== undefined && !deepEqual(configOf(entry), wantConfig)
+        const wantDisabled = override.state === 'disabled'
+        if (entry.disabled !== wantDisabled || configDiffers) {
+          await entry.update({
+            disabled: wantDisabled ? true : null,
+            ...(configDiffers ? { config: structuredClone(wantConfig) } : {}),
+          })
         }
       } catch (error) {
         this.ctx.logger.warn(`dsh-mcp-manage: override ${entryId}: ${String(error)}`)

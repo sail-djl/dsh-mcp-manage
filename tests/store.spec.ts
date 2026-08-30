@@ -8,7 +8,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { loadStore, mintId, saveStore, storePath, validate } from '../src/host/store.ts'
+import { carriedOverride, loadStore, mintId, saveStore, storePath, validate } from '../src/host/store.ts'
 
 let home: string
 
@@ -100,5 +100,36 @@ describe('mintId', () => {
     const one = mintId(existing)
     expect(existing).not.toContain(one)
     expect(one).toMatch(/^srv-[0-9a-f]{8}$/)
+  })
+})
+
+describe('carriedOverride', () => {
+  it('keeps the historical bare shapes when no edit exists', () => {
+    expect(carriedOverride(undefined, 'disabled')).toEqual({ state: 'disabled' })
+    expect(carriedOverride({ state: 'disabled' }, 'disabled')).toEqual({ state: 'disabled' })
+    expect(carriedOverride(undefined, 'modified')).toBeUndefined()
+    expect(carriedOverride({ state: 'disabled' }, 'modified')).toBeUndefined()
+  })
+
+  it('carries a config edit across a toggle in both directions', () => {
+    const edited = { state: 'modified' as const, config: { serverName: 'x' }, options: { id: 'e1' } }
+    const dormant = carriedOverride(edited, 'disabled')
+    expect(dormant).toEqual({ state: 'disabled', config: { serverName: 'x' }, options: { id: 'e1' } })
+    expect(carriedOverride(dormant, 'modified')).toEqual(edited)
+  })
+
+  it('round-trips an edited override through the store document', async () => {
+    await saveStore({
+      servers: [],
+      overrides: {
+        'mcp-edited': { state: 'modified', config: { transport: 'stdio', serverName: 'x', command: 'node' }, options: { id: 'mcp-edited' } },
+        'mcp-edited-off': { state: 'disabled', config: { transport: 'stdio', serverName: 'y', command: 'node' }, options: { id: 'mcp-edited-off' } },
+      },
+    })
+    const store = await loadStore()
+    expect(store.overrides['mcp-edited']?.state).toBe('modified')
+    expect(store.overrides['mcp-edited-off']).toEqual({
+      state: 'disabled', config: { transport: 'stdio', serverName: 'y', command: 'node' }, options: { id: 'mcp-edited-off' },
+    })
   })
 })

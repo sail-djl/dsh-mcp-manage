@@ -5,8 +5,8 @@
  * clickable tool count, enable switch, edit, delete), an add/edit form
  * (stdio command/args/env/cwd or Streamable HTTP url/headers), and the
  * composition-provided MCP catalog — equally manageable at runtime
- * (enable/disable, delete with restore). Styled after the official settings
- * pages (theme variables, card rows).
+ * (enable/disable, edit with one-click revert, delete with restore).
+ * Styled after the official settings pages (theme variables, card rows).
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -19,6 +19,7 @@ import {
   restoreExternal,
   setExternalEnabled,
   setServerEnabled,
+  updateExternalConfig,
   updateServer,
   type MutationResult,
   type ServersSnapshot,
@@ -53,10 +54,10 @@ export const CSS = `
 .mcpm-badge-error { color: var(--dsw-alias-state-error-primary); border-color: var(--dsw-alias-state-error-primary); }
 .mcpm-badge-connecting { color: var(--dsw-alias-state-warn-primary); border-color: var(--dsw-alias-state-warn-primary); }
 .mcpm-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
-.mcpm-switch { position: relative; width: 36px; height: 20px; border-radius: 10px; border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-2); cursor: pointer; padding: 0; }
+.mcpm-switch { position: relative; width: 36px; height: 20px; border-radius: 10px; border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-2); cursor: pointer; padding: 0; flex-shrink: 0; }
 .mcpm-switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--dsw-alias-label-secondary); transition: transform 120ms ease, background 120ms ease; }
-.mcpm-switch[data-on='true'] { background: var(--dsw-alias-brand-primary); }
-.mcpm-switch[data-on='true']::after { transform: translateX(16px); background: #fff; }
+.mcpm-switch[data-on='true'] { background: var(--dsw-alias-brand-primary, #0f1115); border-color: var(--dsw-alias-brand-primary, #0f1115); }
+.mcpm-switch[data-on='true']::after { transform: translateX(16px); background: var(--dsw-alias-label-primary-foreground, #fff); }
 .mcpm-switch:disabled { opacity: 0.5; cursor: default; }
 .mcpm-tools { display: flex; flex-wrap: wrap; gap: 4px; }
 .mcpm-tool { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; padding: 2px 6px; border-radius: 6px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); word-break: break-all; }
@@ -70,7 +71,10 @@ export const CSS = `
 .mcpm-input:focus, .mcpm-select:focus { border-color: var(--dsw-alias-brand-primary); }
 .mcpm-area { box-sizing: border-box; width: 100%; min-height: 60px; resize: vertical; padding: 8px 10px; font: inherit; font-size: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; line-height: 1.6; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-primary); outline: none; }
 .mcpm-area:focus { border-color: var(--dsw-alias-brand-primary); }
-.mcpm-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.mcpm-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; align-items: start; }
+.mcpm-grid .mcpm-field { min-width: 0; }
+.mcpm-hint { font-size: 11px; line-height: 16px; color: var(--dsw-alias-label-tertiary); }
+.mcpm-inline-form { border-top: 1px dashed var(--dsw-alias-border-l2); padding-top: 10px; }
 .mcpm-external { display: flex; flex-direction: column; gap: 8px; }
 `
 
@@ -115,11 +119,15 @@ function ToolList(props: { tools: readonly string[]; expanded: boolean }): JSX.E
 function ServerCard(props: {
   server: McpServerView
   busy: boolean
+  /** Non-null while this card's inline edit form is open. */
+  editing: McpServerDef | null
   onToggle: (server: McpServerView) => void
   onEdit: (server: McpServerView) => void
   onDelete: (server: McpServerView) => void
+  onSubmitEdit: (server: McpServerDef) => void
+  onCancelEdit: () => void
 }): JSX.Element {
-  const { server, busy, onToggle, onEdit, onDelete } = props
+  const { server, busy, editing, onToggle, onEdit, onDelete, onSubmitEdit, onCancelEdit } = props
   const [expanded, setExpanded] = useState(false)
   const [confirming, setConfirming] = useState(false)
   return (
@@ -133,7 +141,8 @@ function ServerCard(props: {
           <button type='button' className='mcpm-switch' data-on={server.enabled} disabled={busy}
             title={server.enabled ? '停用' : '启用'}
             onClick={() => onToggle(server)} aria-label={server.enabled ? '停用' : '启用'} />
-          <button type='button' className='mcpm-btn-ghost' disabled={busy} onClick={() => onEdit(server)}>编辑</button>
+          <button type='button' className='mcpm-btn-ghost' disabled={busy}
+            onClick={() => onEdit(server)}>{editing === null ? '编辑' : '收起'}</button>
           {confirming
             ? (
               <>
@@ -153,23 +162,72 @@ function ServerCard(props: {
       {server.transport === 'stdio'
         ? <div className='mcpm-mono'>{[server.command, ...(server.args ?? [])].join(' ')}</div>
         : <div className='mcpm-mono'>{server.url}</div>}
+      {editing !== null ? (
+        <div className='mcpm-inline-form'>
+          <ServerForm key={editing.id} initial={editing} busy={busy}
+            onSubmit={onSubmitEdit} onCancel={onCancelEdit} />
+        </div>
+      ) : null}
     </div>
   )
 }
 
-/** One composition-provided MCP card: enable switch, delete, restore. */
+/** Read an unknown value as a string-to-string mapping (empty on mismatch). */
+function stringMap(value: unknown): Record<string, string> {
+  if (typeof value !== 'object' || value === null) return {}
+  const out: Record<string, string> = {}
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry === 'string') out[key] = entry
+  }
+  return out
+}
+
+/**
+ * Build an edit-form prefill definition from one composition row's effective
+ * config. Returns null when the row carries no config object (the edit
+ * button then stays disabled) — every field degrades to its form default.
+ */
+function defFromConfig(row: McpExternalServer): McpServerDef | null {
+  const config = row.config
+  if (typeof config !== 'object' || config === null) return null
+  const c = config as Record<string, unknown>
+  const str = (value: unknown): string => typeof value === 'string' ? value : ''
+  return {
+    id: row.entryId,
+    serverName: str(c.serverName) !== '' ? str(c.serverName) : row.serverName,
+    transport: c.transport === 'streamable-http' ? 'streamable-http' : 'stdio',
+    enabled: true,
+    command: str(c.command),
+    args: Array.isArray(c.args) ? c.args.filter((arg): arg is string => typeof arg === 'string') : [],
+    env: stringMap(c.env),
+    cwd: str(c.cwd),
+    url: str(c.url),
+    headers: stringMap(c.headers),
+    toolCallTimeoutMs: typeof c.toolCallTimeoutMs === 'number' ? c.toolCallTimeoutMs : undefined,
+    createdAt: 0,
+    updatedAt: 0,
+  }
+}
+
+/** One composition-provided MCP card: enable switch, edit, delete, restore. */
 function ExternalCard(props: {
   row: McpExternalServer
   busy: boolean
+  /** Non-null while this card's inline edit form is open. */
+  editing: McpExternalServer | null
   onToggle: (row: McpExternalServer) => void
+  onEdit: (row: McpExternalServer) => void
+  onSubmitEdit: (row: McpExternalServer, server: McpServerDef) => void
+  onCancelEdit: () => void
   onDelete: (row: McpExternalServer) => void
   onRestore: (row: McpExternalServer) => void
 }): JSX.Element {
-  const { row, busy, onToggle, onDelete, onRestore } = props
+  const { row, busy, editing, onToggle, onEdit, onSubmitEdit, onCancelEdit, onDelete, onRestore } = props
   const [expanded, setExpanded] = useState(false)
   const [confirming, setConfirming] = useState(false)
   const removed = row.override === 'removed'
   const disabled = row.override === 'disabled'
+  const prefill = defFromConfig(row)
   return (
     <div className='mcpm-card' style={removed ? { opacity: 0.65 } : undefined}>
       <div className='mcpm-card-top'>
@@ -189,11 +247,14 @@ function ExternalCard(props: {
                 <button type='button' className='mcpm-switch' data-on={!disabled} disabled={busy}
                   title={disabled ? '启用' : '停用'}
                   onClick={() => onToggle(row)} aria-label={disabled ? '启用' : '停用'} />
+                <button type='button' className='mcpm-btn-ghost' disabled={busy || prefill === null}
+                  title={prefill === null ? '该行没有可解析的配置' : undefined}
+                  onClick={() => onEdit(row)}>{editing === null ? '编辑' : '收起'}</button>
                 {confirming
                   ? (
                     <>
                       <button type='button' className='mcpm-btn-ghost mcpm-btn-danger' disabled={busy}
-                        onClick={() => onDelete(row)}>确认移除</button>
+                        onClick={() => { setConfirming(false); onDelete(row) }}>确认移除</button>
                       <button type='button' className='mcpm-btn-ghost' disabled={busy} onClick={() => setConfirming(false)}>取消</button>
                     </>
                   )
@@ -206,6 +267,15 @@ function ExternalCard(props: {
         </span>
       </div>
       <ToolList tools={row.tools} expanded={expanded} />
+      {editing !== null && prefill !== null ? (
+        <div className='mcpm-inline-form'>
+          <p className='mcpm-hint'>
+            编辑的是运行时覆盖配置，源组合文件不会被修改；保存后立即生效并跨宿主重启保持。
+          </p>
+          <ServerForm key={row.entryId} initial={prefill} busy={busy} submitLabel='保存并重启'
+            onSubmit={server => onSubmitEdit(row, server)} onCancel={onCancelEdit} />
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -305,10 +375,12 @@ function draftToServer(draft: Draft): McpServerDef {
 function ServerForm(props: {
   initial: McpServerDef | null
   busy: boolean
+  /** Submit button label (defaults to the managed add/edit wording). */
+  submitLabel?: string
   onSubmit: (server: McpServerDef) => void
   onCancel: () => void
 }): JSX.Element {
-  const { initial, busy, onSubmit, onCancel } = props
+  const { initial, busy, submitLabel, onSubmit, onCancel } = props
   const [draft, setDraft] = useState<Draft>(initial === null ? EMPTY_DRAFT : draftOf(initial))
   const [error, setError] = useState('')
   const set = (patch: Partial<Draft>): void => setDraft({ ...draft, ...patch })
@@ -323,9 +395,10 @@ function ServerForm(props: {
     <div className='mcpm-form'>
       <div className='mcpm-grid'>
         <div className='mcpm-field'>
-          <label className='mcpm-label'>服务器名称（serverName，工具前缀 mcp__名称__*，仅字母数字_-，≤32）</label>
+          <label className='mcpm-label'>服务器名称</label>
           <input className='mcpm-input' value={draft.serverName}
             onChange={e => set({ serverName: e.target.value })} placeholder='例如 adb' />
+          <div className='mcpm-hint'>工具前缀 mcp__名称__*；仅字母、数字、_、-，≤32 字符</div>
         </div>
         <div className='mcpm-field'>
           <label className='mcpm-label'>传输方式</label>
@@ -340,49 +413,56 @@ function ServerForm(props: {
         <>
           <div className='mcpm-grid'>
             <div className='mcpm-field'>
-              <label className='mcpm-label'>启动命令（command）</label>
+              <label className='mcpm-label'>启动命令</label>
               <input className='mcpm-input' value={draft.command}
                 onChange={e => set({ command: e.target.value })} placeholder='例如 node' />
+              <div className='mcpm-hint'>可执行文件名或绝对路径（command）</div>
             </div>
             <div className='mcpm-field'>
-              <label className='mcpm-label'>工作目录（cwd，留空 = DSH 当前目录）</label>
+              <label className='mcpm-label'>工作目录</label>
               <input className='mcpm-input' value={draft.cwd}
                 onChange={e => set({ cwd: e.target.value })} placeholder='H:\\AIGC\\mcp\\adb-mcp-master' />
+              <div className='mcpm-hint'>留空 = DSH 当前目录（cwd）</div>
             </div>
           </div>
           <div className='mcpm-field'>
-            <label className='mcpm-label'>参数（args，每行一个）</label>
+            <label className='mcpm-label'>参数</label>
             <textarea className='mcpm-area' value={draft.argsText}
               onChange={e => set({ argsText: e.target.value })} placeholder={'dist/index.js'} />
+            <div className='mcpm-hint'>每行一个参数（args）</div>
           </div>
           <div className='mcpm-field'>
-            <label className='mcpm-label'>环境变量（每行 KEY=VALUE）</label>
+            <label className='mcpm-label'>环境变量</label>
             <textarea className='mcpm-area' value={draft.envText}
               onChange={e => set({ envText: e.target.value })} placeholder={'API_KEY=...'} />
+            <div className='mcpm-hint'>每行一条，格式 KEY=VALUE</div>
           </div>
         </>
       ) : (
         <>
           <div className='mcpm-field'>
-            <label className='mcpm-label'>端点 URL（http/https）</label>
+            <label className='mcpm-label'>端点 URL</label>
             <input className='mcpm-input' value={draft.url}
               onChange={e => set({ url: e.target.value })} placeholder='http://127.0.0.1:3000/mcp' />
+            <div className='mcpm-hint'>Streamable HTTP 端点（http/https）</div>
           </div>
           <div className='mcpm-field'>
-            <label className='mcpm-label'>附加请求头（每行 KEY: VALUE）</label>
+            <label className='mcpm-label'>附加请求头</label>
             <textarea className='mcpm-area' value={draft.headersText}
               onChange={e => set({ headersText: e.target.value })} placeholder={'Authorization: Bearer ...'} />
+            <div className='mcpm-hint'>每行一条，格式 KEY: VALUE</div>
           </div>
         </>
       )}
       <div className='mcpm-field'>
-        <label className='mcpm-label'>工具调用超时（毫秒，留空 = 60000）</label>
+        <label className='mcpm-label'>工具调用超时</label>
         <input className='mcpm-input' value={draft.toolCallTimeoutMs}
           onChange={e => set({ toolCallTimeoutMs: e.target.value })} placeholder='60000' />
+        <div className='mcpm-hint'>毫秒；留空 = 60000</div>
       </div>
       {error !== '' ? <div className='mcpm-err'>{error}</div> : null}
       <div className='mcpm-row'>
-        <button type='button' className='mcpm-btn' disabled={busy} onClick={submit}>保存并加载</button>
+        <button type='button' className='mcpm-btn' disabled={busy} onClick={submit}>{submitLabel ?? '保存并加载'}</button>
         <button type='button' className='mcpm-btn-ghost' disabled={busy} onClick={onCancel}>取消</button>
       </div>
     </div>
@@ -397,6 +477,8 @@ export function McpManageSection(): JSX.Element {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [editing, setEditing] = useState<McpServerDef | null>(null)
+  /** The composition row whose inline edit form is open (null = closed). */
+  const [editingExternal, setEditingExternal] = useState<McpExternalServer | null>(null)
   const [showForm, setShowForm] = useState(false)
   const noticeTimer = useRef<number | undefined>(undefined)
 
@@ -484,6 +566,28 @@ export function McpManageSection(): JSX.Element {
     run(() => restoreExternal(row.entryId), '已恢复')
   }
 
+  /** Open/close one composition row's inline edit form (one form at a time). */
+  const editExternal = (row: McpExternalServer): void => {
+    setEditingExternal(current => current !== null && current.entryId === row.entryId ? null : row)
+    setEditing(null)
+    setShowForm(false)
+  }
+
+  /** Persist one composition row's edited config; keep the form open on failure. */
+  const submitExternalEdit = (row: McpExternalServer, server: McpServerDef): void => {
+    setBusy(true)
+    updateExternalConfig(row.entryId, server)
+      .then(() => {
+        refresh()
+        setError('')
+        setNotice('已保存并重启')
+        clearNoticeSoon()
+        setEditingExternal(null)
+      })
+      .catch(e => setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setBusy(false))
+  }
+
   return (
     <div className='mcpm-page'>
       <section className='mcpm-section'>
@@ -502,12 +606,21 @@ export function McpManageSection(): JSX.Element {
         {snapshot !== null
           ? snapshot.servers.map(server => (
             <ServerCard key={server.id} server={server} busy={busy}
-              onToggle={toggle} onEdit={s => { setEditing(s); setShowForm(true) }} onDelete={remove} />
+              editing={editing !== null && editing.id === server.id ? editing : null}
+              onToggle={toggle}
+              onEdit={s => {
+                setEditing(current => current !== null && current.id === s.id ? null : s)
+                setEditingExternal(null)
+                setShowForm(false)
+              }}
+              onDelete={remove}
+              onSubmitEdit={submit}
+              onCancelEdit={() => setEditing(null)} />
           ))
           : null}
         {!showForm ? (
           <button type='button' className='mcpm-btn' style={{ alignSelf: 'flex-start' }}
-            onClick={() => { setEditing(null); setShowForm(true) }}>添加服务器</button>
+            onClick={() => { setEditing(null); setEditingExternal(null); setShowForm(true) }}>添加服务器</button>
         ) : null}
         {showForm ? (
           <ServerForm initial={editing} busy={busy} onSubmit={submit}
@@ -518,8 +631,8 @@ export function McpManageSection(): JSX.Element {
       <section className='mcpm-section'>
         <h3 className='mcpm-section-head'>来自组合配置的 MCP</h3>
         <p className='mcpm-desc'>
-          以下 MCP 服务器由 DSH 组合文件（cordis.yml / patch）提供，同样可以停用或移除（可恢复）；
-          覆盖状态保存在本机，主机重启后自动维持。源组合文件不会被修改。
+          以下 MCP 服务器由 DSH 组合文件（cordis.yml / patch）提供，同样可以在运行时直接编辑、停用或移除（可恢复）；
+          编辑保存为运行时覆盖并立即生效，覆盖状态保存在本机，主机重启后自动维持。源组合文件不会被修改。
         </p>
         {loaded && snapshot !== null && snapshot.external.length === 0
           ? <p className='mcpm-empty'>没有来自组合配置的 MCP 服务器。</p>
@@ -528,7 +641,12 @@ export function McpManageSection(): JSX.Element {
           <div className='mcpm-external'>
             {snapshot.external.map(row => (
               <ExternalCard key={row.entryId} row={row} busy={busy}
-                onToggle={toggleExternal} onDelete={deleteExternal} onRestore={restoreExternalRow} />
+                editing={editingExternal !== null && editingExternal.entryId === row.entryId ? editingExternal : null}
+                onToggle={toggleExternal}
+                onEdit={editExternal}
+                onSubmitEdit={submitExternalEdit}
+                onCancelEdit={() => setEditingExternal(null)}
+                onDelete={deleteExternal} onRestore={restoreExternalRow} />
             ))}
           </div>
         ) : null}
