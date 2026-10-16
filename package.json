@@ -1,7 +1,7 @@
 {
   "name": "dsh-mcp-manage",
   "description": "MCP management for the DSH web GUI: a settings page (设置 → MCP 管理) that lists every installed MCP tool and adds / edits / deletes / enables / disables MCP servers at runtime — no host restart, no dsh source changes.",
-  "version": "0.2.0",
+  "version": "0.2.0-local.1",
   "type": "module",
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
