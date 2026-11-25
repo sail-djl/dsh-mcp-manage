@@ -10,6 +10,7 @@
  * @module dsh-mcp-manage/host/manager
  */
 
+import { homedir } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
 import type {
   McpExternalOverride, McpExternalServer, McpRuntimeState, McpServerDef, McpServerView,
@@ -186,7 +187,11 @@ export class McpManager {
         command: def.command,
         args: def.args ?? [],
         env: def.env ?? {},
-        cwd: def.cwd === undefined || def.cwd === '' ? process.cwd() : def.cwd,
+        // Default to the user's home rather than the host process's working
+        // directory: the host cwd can be a project tree (e.g. a pnpm-managed
+        // node_modules symlink farm) where npx's local resolution stalls, so
+        // an empty cwd must not inherit an arbitrary directory.
+        cwd: def.cwd === undefined || def.cwd === '' ? homedir() : def.cwd,
         toolCallTimeoutMs: def.toolCallTimeoutMs ?? 60_000,
         failOnStartupError: def.failOnStartupError ?? false,
       }
